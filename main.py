@@ -8,39 +8,31 @@ from fastapi.responses import StreamingResponse
 from contextlib import asynccontextmanager
 import io
 
-# --- CẤU HÌNH ĐƯỜNG DẪN (Tương đối theo thư mục dự án) ---
+# --- CẤU HÌNH ---
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 YOLO_MODEL_PATH = os.path.join(BASE_DIR, "model", "test.pt")
 MOBILENET_MODEL_PATH = os.path.join(BASE_DIR, "model", "mobilenetv2_custom_float32.tflite")
-
 CLASS_NAMES = ["fresh", "spoiled"]
 INPUT_SIZE = 224
 
-# Biến toàn cục để lưu model
 models = {}
 
-# --- HÀM KHỞI TẠO MODEL (Load 1 lần khi bật server) ---
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     print("⏳ Loading models...")
-    # Load YOLO
     models["yolo"] = YOLO(YOLO_MODEL_PATH)
-    
-    # Load TFLite
     interpreter = tf.lite.Interpreter(model_path=MOBILENET_MODEL_PATH)
     interpreter.allocate_tensors()
     models["tflite"] = interpreter
     models["input_details"] = interpreter.get_input_details()
     models["output_details"] = interpreter.get_output_details()
-    
-    print("✅ Models loaded successfully!")
+    print("✅ Models loaded!")
     yield
-    # Clean up nếu cần
     models.clear()
 
 app = FastAPI(lifespan=lifespan)
 
-# --- HÀM XỬ LÝ PHỤ TRỢ ---
+# Hàm phụ trợ (giữ nguyên)
 def preprocess_tflite(img):
     img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img = cv2.resize(img, (INPUT_SIZE, INPUT_SIZE))
@@ -52,9 +44,7 @@ def classify_tflite(crop):
     interpreter = models["tflite"]
     input_details = models["input_details"]
     output_details = models["output_details"]
-
-    input_data = preprocess_tflite(crop)
-    interpreter.set_tensor(input_details[0]['index'], input_data)
+    interpreter.set_tensor(input_details[0]['index'], preprocess_tflite(crop))
     interpreter.invoke()
     output = interpreter.get_tensor(output_details[0]['index'])[0]
     prob = tf.nn.softmax(output).numpy()
@@ -62,52 +52,64 @@ def classify_tflite(crop):
 
 @app.get("/")
 def home():
-    return {"message": "Pork Quality Check API is Running"}
+    return {"message": "HeoScan API is running"}
 
-# --- API CHÍNH: NHẬN ẢNH VÀ TRẢ KẾT QUẢ ---
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
-    # 1. Đọc file ảnh từ App gửi lên
+    # 1. Đọc ảnh
     contents = await file.read()
     nparr = np.frombuffer(contents, np.uint8)
     frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
     if frame is None:
-        return {"error": "Cannot read image"}
+        return {"error": "Invalid image"}
 
-    # 2. Chạy YOLO detect thịt
+    # 2. Detect bằng YOLO
     results = models["yolo"](frame, conf=0.4, verbose=False)
-    pork_detected = False
+    
+    pork_found_count = 0 # Biến đếm số lượng thịt tìm thấy
 
     for r in results:
         boxes = r.boxes
-        if boxes is None:
-            continue
+        if boxes is None: continue
+        
         for box in boxes:
             x1, y1, x2, y2 = map(int, box.xyxy[0])
-            cls_name = models["yolo"].names[int(box.cls.item())]
-
-            # Chỉ xử lý nếu là 'pork' (hoặc class bạn muốn)
-            # Lưu ý: check lại xem model YOLO của bạn trả về tên class chính xác là gì
-            # Nếu model bạn train chỉ có 1 class thì bỏ qua check tên cũng được
-            # if cls_name.lower() != "pork": continue 
             
-            pork_detected = True
+            # --- QUAN TRỌNG: Kiểm tra class name ---
+            # Nếu model của bạn chỉ train 1 class 'pork' thì index 0 luôn là pork.
+            # Nếu bạn muốn chắc chắn, hãy uncomment dòng dưới:
+            # cls_name = models["yolo"].names[int(box.cls.item())]
+            # if cls_name != "pork": continue 
+            
+            pork_found_count += 1
 
-            # Crop và chạy Classifier
+            # Crop và check độ tươi
             crop = frame[y1:y2, x1:x2]
             if crop.size == 0: continue
-
+            
             freshness, conf = classify_tflite(crop)
-
-            # Vẽ màu: Xanh (Fresh) - Đỏ (Spoiled)
+            
+            # Vẽ khung
             color = (0, 255, 0) if freshness == "fresh" else (0, 0, 255)
             label = f"{freshness.upper()} {conf:.2f}"
-
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 3)
-            cv2.putText(frame, label, (x1, y1 - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+            cv2.putText(frame, label, (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
 
-    # 3. Mã hóa ảnh lại thành JPEG để trả về
-    res, im_png = cv2.imencode(".jpg", frame)
-    return StreamingResponse(io.BytesIO(im_png.tobytes()), media_type="image/jpeg")
+    # 3. XỬ LÝ KHI KHÔNG TÌM THẤY THỊT
+    if pork_found_count == 0:
+        # Lấy kích thước ảnh để vẽ chữ vào giữa
+        h, w = frame.shape[:2]
+        text = "KHONG TIM THAY THIT"
+        font_scale = 1.5
+        thickness = 3
+        text_size = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)[0]
+        text_x = (w - text_size[0]) // 2
+        text_y = (h + text_size[1]) // 2
+        
+        # Vẽ chữ đỏ nền trắng cho dễ đọc
+        cv2.putText(frame, text, (text_x, text_y), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), thickness)
+
+    # 4. Trả ảnh về (Dù có thịt hay không cũng trả về ảnh để hiện lên ResultScreen)
+    res, im_jpg = cv2.imencode(".jpg", frame)
+    return StreamingResponse(io.BytesIO(im_jpg.tobytes()), media_type="image/jpeg")
